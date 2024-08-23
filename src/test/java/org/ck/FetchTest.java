@@ -22,7 +22,7 @@ public class FetchTest extends TestCase {
         Web3j web3j = Web3j.build(new HttpService("https://mainnet.infura.io/v3/87dd52c6af094eb2a518f5a1349aba03"));
         Properties properties = new Properties();
         EthereumBalanceFetcher fetcher = new EthereumBalanceFetcher(web3j, properties);
-        fetcher.fetch(1L, 20569025L, "positive_balances.csv");
+        fetcher.fetch(1L, 20569025L);
         log.info("fetch done");
     }
 }

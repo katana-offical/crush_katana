@@ -1,15 +1,15 @@
 package org.ck;
 
 import com.google.common.collect.ImmutableList;
+import junit.framework.Assert;
 import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestSuite;
-import org.bitcoinj.core.ECKey;
-import org.bitcoinj.core.LegacyAddress;
-import org.bitcoinj.core.NetworkParameters;
-import org.bitcoinj.core.SegwitAddress;
+import org.bitcoinj.core.*;
 import org.bitcoinj.crypto.*;
 import org.bitcoinj.params.MainNetParams;
+import org.bitcoinj.script.Script;
+import org.bitcoinj.script.ScriptBuilder;
 import org.bitcoinj.wallet.DeterministicSeed;
 import org.bitcoinj.wallet.UnreadableWalletException;
 import org.ck.account.KeyPairUtils;
@@ -76,17 +76,20 @@ public class MnemonicTest extends TestCase {
     }
 
     public void testMnemonicForBtc() throws UnreadableWalletException {
+        // 使用一个12个单词的助记词
         String mnemonic = "angry lion together divide square oblige film together rebel possible bonus above";
-
         String passphrase = "";
 
+        // 将助记词转换为种子
         DeterministicSeed seed = new DeterministicSeed(mnemonic, null, passphrase, 0L);
 
+        // 定义比特币主网参数
         NetworkParameters params = MainNetParams.get();
 
+        // 生成根私钥（Master Private Key）
         DeterministicKey masterKey = HDKeyDerivation.createMasterPrivateKey(Objects.requireNonNull(seed.getSeedBytes()));
 
-        // use BIP-44 path：m/44'/0'/0'/0/0
+        // 使用 BIP-44 的派生路径：m/44'/0'/0'/0/0
         List<ChildNumber> bip44Path = ImmutableList.of(
                 new ChildNumber(44, true),
                 new ChildNumber(0, true),
@@ -95,10 +98,11 @@ public class MnemonicTest extends TestCase {
                 ChildNumber.ZERO
         );
 
-        // generate private key and public key
+        // 通过派生路径生成子私钥
         DeterministicHierarchy hierarchy = new DeterministicHierarchy(masterKey);
         DeterministicKey childKey = hierarchy.get(bip44Path, true, true);
 
+        // 生成私钥和公钥
         ECKey privateKey = ECKey.fromPrivate(childKey.getPrivKeyBytes());
         String privateKeyHex = privateKey.getPrivateKeyAsHex();
         String publicKeyHex = privateKey.getPublicKeyAsHex();
@@ -106,12 +110,19 @@ public class MnemonicTest extends TestCase {
         log.info("Private Key: " + privateKeyHex);
         log.info("Public Key: " + publicKeyHex);
 
-        // generate Legacy address
+        // 生成 Legacy 地址（P2PKH）
         LegacyAddress legacyAddress = LegacyAddress.fromPubKeyHash(params, privateKey.getPubKeyHash());
-        log.info("Legacy Address: " + legacyAddress);
+        log.info("Legacy Address (P2PKH): " + legacyAddress);
 
-        // generate SegWit address
+        // 生成 Nested SegWit 地址（P2SH）
+        Script p2wpkhScript = ScriptBuilder.createP2WPKHOutputScript(privateKey);
+        Script p2shScript = ScriptBuilder.createP2SHOutputScript(p2wpkhScript);
+        LegacyAddress p2shAddress = LegacyAddress.fromScriptHash(params, Utils.sha256hash160(p2shScript.getProgram()));
+        log.info("Nested SegWit Address (P2SH): " + p2shAddress);
+
+        // 生成 Native SegWit 地址（Bech32）
+        // todo:bad address? can not match address generate by unisat
         SegwitAddress segwitAddress = SegwitAddress.fromKey(params, privateKey);
-        log.info("SegWit Address: " + segwitAddress);
+        log.info("Native SegWit Address (Bech32): " + segwitAddress);
     }
 }

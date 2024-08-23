@@ -37,7 +37,7 @@ public enum English implements WordList {
         return ' ';
     }
 
-    private final static String[] words = new String[]{
+    public final static String[] words = new String[]{
             "abandon",
             "ability",
             "able",

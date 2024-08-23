@@ -10,7 +10,7 @@ public interface OfflineFetch {
      * @param fromBlockNo
      * @param toBlockNo
      */
-    void fetch(Long fromBlockNo, Long toBlockNo, String outputPath) throws Exception;
+    void fetch(Long fromBlockNo, Long toBlockNo) throws Exception;
 
 
 }

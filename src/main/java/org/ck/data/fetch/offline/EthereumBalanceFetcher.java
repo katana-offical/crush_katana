@@ -39,7 +39,7 @@ public class EthereumBalanceFetcher implements OfflineFetch {
     }
 
     @Override
-    public void fetch(Long fromBlockNo, Long toBlockNo, String outputPath) {
+    public void fetch(Long fromBlockNo, Long toBlockNo) {
         validateBlockRange(fromBlockNo, toBlockNo);
 
         BigInteger lastProcessedBlock = getLastProcessedBlock(fromBlockNo);
