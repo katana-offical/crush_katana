@@ -20,6 +20,7 @@ public class Retry {
                     log.error("Operation failed after {} attempts: {}", attempts, e.getMessage());
                     throw e;
                 }
+                log.warn(e.getMessage(), e);
                 log.warn("Operation failed, retrying... (attempt {} of {})", attempts, maxRetryTime);
                 try {
                     Thread.sleep(failSleepTimeMills);

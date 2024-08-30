@@ -42,6 +42,14 @@ public class SeqQueueStrategyTest {
         assertTrue("Second task ID should be greater than first task ID", id2.compareTo(id1) > 0);
     }
 
+
+    @Test
+    public void testTaskAllocationMultiTimes(){
+        for(int i=0; i<100000; i++){
+            testTaskAllocation();
+        }
+    }
+
     @Test
     public void testProgressPersistence() {
         Task task = seqQueueStrategy.acquireTask();

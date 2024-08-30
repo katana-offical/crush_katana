@@ -1,5 +1,6 @@
 package org.ck.cluster;
 
+import org.bitcoinj.crypto.MnemonicCode;
 import org.ck.persistence.Database;
 import org.ck.persistence.PersistenceFactory;
 import org.ck.wordlist.English;
@@ -11,6 +12,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Properties;
 
 public class SeqQueueStrategy implements AllocateStrategy {
@@ -37,18 +39,21 @@ public class SeqQueueStrategy implements AllocateStrategy {
     public Task acquireTask() {
         BigInteger nextIndex = getLastProcessedIndex().add(BigInteger.ONE);
 
-        if (nextIndex.compareTo(totalCombinations) >= 0) {
-            log.info("All tasks have been distributed.");
-            return null; // No more tasks available
+        while (nextIndex.compareTo(totalCombinations) < 0) {
+            String[] taskMnemonic = getMnemonicCombination(nextIndex);
+            if (isValidMnemonic(taskMnemonic)) {
+                Task task = new Task();
+                task.setMnemonic(taskMnemonic);
+                task.setTaskId(nextIndex.toString());
+                saveTask(task);
+                saveProgress(nextIndex);
+                return task;
+            }
+            nextIndex = nextIndex.add(BigInteger.ONE);
         }
 
-        String[] taskMnemonic = getMnemonicCombination(nextIndex);
-        Task task = new Task();
-        task.setMnemonic(taskMnemonic);
-        task.setTaskId(nextIndex.toString());
-        saveTask(task);
-        saveProgress(nextIndex);
-        return task;
+        log.info("All valid tasks have been distributed.");
+        return null; // No more valid tasks available
     }
 
     @Override
@@ -131,6 +136,17 @@ public class SeqQueueStrategy implements AllocateStrategy {
         }
 
         return combination;
+    }
+
+    private boolean isValidMnemonic(String[] mnemonic) {
+        try {
+            List<String> mnemonicList = Arrays.asList(mnemonic);
+            MnemonicCode.INSTANCE.check(mnemonicList);
+            return true;
+        } catch (Exception e) {
+            log.warn("Invalid mnemonic combination: " + String.join(" ", mnemonic));
+            return false;
+        }
     }
 
     private BigInteger calculateCombinations(int n, int k) {

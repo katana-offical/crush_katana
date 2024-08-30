@@ -18,24 +18,37 @@ import java.math.BigInteger;
 import java.security.InvalidParameterException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.Properties;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ForkJoinPool;
+import java.util.stream.Collectors;
 
 public class EthereumBalanceFetcher implements OfflineFetch {
     private static final Logger log = LoggerFactory.getLogger(EthereumBalanceFetcher.class);
     private static final String PROGRESS_TABLE = "eth_balances_progress";
     private static final String BALANCES_TABLE = "eth_balances";
 
-    private final Web3j web3j;
+    private final List<Web3j> web3jArr;
     private final Properties config;
     private final Database database;
+    private final ForkJoinPool customThreadPool;
+    private final int maxBlocksPerBatch;  // 每批次最大区块数量
 
-    public EthereumBalanceFetcher(Web3j web3j, Properties config) {
-        this.web3j = web3j;
+    private final Random random = new Random();
+
+
+    public EthereumBalanceFetcher(List<Web3j> web3jArr, Properties config) {
+        this.web3jArr = web3jArr;
         this.config = config;
         this.database = PersistenceFactory.createDatabase("sqlite"); // 使用 SQLite 数据库
+        this.customThreadPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors()); // 根据CPU核心数调整并行度
+        this.maxBlocksPerBatch = Integer.parseInt(config.getProperty("max.blocks.per.batch", "8"));  // 可配置的最大区块数量
         initializeDatabase(); // 初始化数据库表
+    }
+
+    private Web3j getRandomWeb3j() {
+        return web3jArr.get(random.nextInt(web3jArr.size()));
     }
 
     @Override
@@ -46,13 +59,16 @@ public class EthereumBalanceFetcher implements OfflineFetch {
 
         for (BigInteger blockNumber = lastProcessedBlock;
              blockNumber.compareTo(BigInteger.valueOf(toBlockNo)) <= 0;
-             blockNumber = blockNumber.add(BigInteger.ONE)) {
+             blockNumber = blockNumber.add(BigInteger.valueOf(maxBlocksPerBatch))) {
+
+            BigInteger batchEndBlock = blockNumber.add(BigInteger.valueOf(maxBlocksPerBatch - 1))
+                    .min(BigInteger.valueOf(toBlockNo));
 
             try {
-                processBlock(blockNumber);
-                saveProgress(blockNumber);
+                processBlocksInRange(blockNumber, batchEndBlock);
+                saveProgress(batchEndBlock);
             } catch (Exception e) {
-                log.error("Failed to process block " + blockNumber, e);
+                log.error("Failed to process blocks from " + blockNumber + " to " + batchEndBlock, e);
                 break;  // 终止处理并报告错误
             }
         }
@@ -71,6 +87,11 @@ public class EthereumBalanceFetcher implements OfflineFetch {
 
         database.executeUpdate(createProgressTableSQL);
         database.executeUpdate(createBalancesTableSQL);
+
+        // 提高SQLite的写入性能
+        database.executeQuery("PRAGMA journal_mode=WAL;", rs -> {});
+
+        database.executeUpdate("PRAGMA synchronous=NORMAL;");
     }
 
     private BigInteger getLastProcessedBlock(Long fromBlockNo) {
@@ -107,11 +128,11 @@ public class EthereumBalanceFetcher implements OfflineFetch {
     private void validateBlockRange(Long fromBlockNo, Long toBlockNo) {
         BigInteger latestBlockNumber = Retry.doRetry(() -> {
                     try {
-                        return web3j.ethBlockNumber().send().getBlockNumber();
+                        return getRandomWeb3j().ethBlockNumber().send().getBlockNumber();
                     } catch (IOException e) {
                         throw new RuntimeException(e);
                     }
-                }, Integer.parseInt(config.getProperty("retry.max.attempts", "3")),
+                }, Integer.parseInt(config.getProperty("retry.max.attempts", "10")),
                 Long.parseLong(config.getProperty("retry.sleep.time", "1000")));
 
         if (fromBlockNo < 1 || fromBlockNo > toBlockNo) {
@@ -123,91 +144,113 @@ public class EthereumBalanceFetcher implements OfflineFetch {
         }
     }
 
-    private void processBlock(BigInteger blockNumber) {
-        EthBlock block = Retry.doRetry(() -> {
-                    try {
-                        return web3j.ethGetBlockByNumber(new DefaultBlockParameterNumber(blockNumber), true).send();
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                }, Integer.parseInt(config.getProperty("retry.max.attempts", "3")),
-                Long.parseLong(config.getProperty("retry.sleep.time", "1000")));
+    private void processBlocksInRange(BigInteger startBlock, BigInteger endBlock) {
+        List<EthBlock> blocks = getBlocksInRange(startBlock, endBlock);
 
-        String minerAddress = block.getBlock().getMiner();
-        updateBalance(minerAddress);
+        blocks.forEach(block -> {
+            String minerAddress = block.getBlock().getMiner();
+            List<String> addressesToUpdate = new ArrayList<>();
+            addressesToUpdate.add(minerAddress);
 
-        block.getBlock().getTransactions().forEach(transactionResult -> {
-            EthBlock.TransactionObject transaction = (EthBlock.TransactionObject) transactionResult.get();
+            customThreadPool.submit(() ->
+                    block.getBlock().getTransactions().parallelStream().forEach(transactionResult -> {
+                        EthBlock.TransactionObject transaction = (EthBlock.TransactionObject) transactionResult.get();
+                        String fromAddress = transaction.getFrom();
+                        String toAddress = transaction.getTo();
 
-            String fromAddress = transaction.getFrom();
-            String toAddress = transaction.getTo();
-
-            if (fromAddress != null) {
-                updateBalance(fromAddress);
-            }
-
-            if (toAddress != null) {
-                updateBalance(toAddress);
-            }
-        });
-
-        log.info(String.format("Processed block %d, transactions: %d", blockNumber, block.getBlock().getTransactions().size()));
-    }
-
-    private void updateBalance(String address) {
-        if (address == null) return;
-
-        try {
-            EthGetBalance ethGetBalance = Retry.doRetry(() -> {
-                        try {
-                            return web3j.ethGetBalance(address, DefaultBlockParameterName.LATEST).send();
-                        } catch (IOException e) {
-                            throw new RuntimeException(e);
+                        if (fromAddress != null) {
+                            addressesToUpdate.add(fromAddress);
                         }
-                    }, Integer.parseInt(config.getProperty("retry.max.attempts", "3")),
-                    Long.parseLong(config.getProperty("retry.sleep.time", "1000")));
+                        if (toAddress != null) {
+                            addressesToUpdate.add(toAddress);
+                        }
+                    })
+            ).join();
 
-            BigInteger balanceInWei = ethGetBalance.getBalance();
-            BigDecimal balanceInEth = Convert.fromWei(balanceInWei.toString(), Convert.Unit.ETHER);
+            batchUpdateBalances(addressesToUpdate);
 
-            if (balanceInEth.compareTo(BigDecimal.ZERO) > 0) {
-                saveOrUpdateBalance(address, balanceInEth);
-            }
-        } catch (Exception e) {
-            log.error("Error checking balance for address " + address, e);
-        }
+            log.info(String.format("Processed block %d, transactions: %d", block.getBlock().getNumber(), block.getBlock().getTransactions().size()));
+        });
     }
 
-    private void saveOrUpdateBalance(String address, BigDecimal balance) {
-        String selectSQL = "SELECT balance FROM " + BALANCES_TABLE + " WHERE address = ?;";
-        String updateSQL = "UPDATE " + BALANCES_TABLE + " SET balance = ? WHERE address = ?;";
-        String insertSQL = "INSERT INTO " + BALANCES_TABLE + " (address, balance) VALUES (?, ?);";
+    private List<EthBlock> getBlocksInRange(BigInteger startBlock, BigInteger endBlock) {
+        List<CompletableFuture<EthBlock>> futures = new ArrayList<>();
 
-        try (Connection conn = database.getConnection();
-             PreparedStatement selectPstmt = conn.prepareStatement(selectSQL)) {
+        for (BigInteger blockNumber = startBlock; blockNumber.compareTo(endBlock) <= 0; blockNumber = blockNumber.add(BigInteger.ONE)) {
+            final BigInteger currentBlockNumber = blockNumber;  // 使用局部 final 变量
+            CompletableFuture<EthBlock> future = CompletableFuture.supplyAsync(() -> {
+                return Retry.doRetry(() -> {
+                            try {
+                                return getRandomWeb3j().ethGetBlockByNumber(new DefaultBlockParameterNumber(currentBlockNumber), true).send();
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        }, Integer.parseInt(config.getProperty("retry.max.attempts", "10")),
+                        Long.parseLong(config.getProperty("retry.sleep.time", "1000")));
+            }, customThreadPool);
+            futures.add(future);
+        }
 
-            selectPstmt.setString(1, address);
-            ResultSet rs = selectPstmt.executeQuery();
+        return futures.stream().map(CompletableFuture::join).collect(Collectors.toList());
+    }
 
-            if (rs.next()) {
-                BigDecimal existingBalance = rs.getBigDecimal("balance");
-                balance = balance.add(existingBalance);
+    private void batchUpdateBalances(List<String> addresses) {
+        List<CompletableFuture<Void>> futures = addresses.stream()
+                .map(address -> CompletableFuture.runAsync(() -> {
+                    try {
+                        EthGetBalance ethGetBalance = Retry.doRetry(() -> {
+                                    try {
+                                        return getRandomWeb3j().ethGetBalance(address, DefaultBlockParameterName.LATEST).send();
+                                    } catch (IOException e) {
+                                        throw new RuntimeException(e);
+                                    }
+                                }, Integer.parseInt(config.getProperty("retry.max.attempts", "10")),
+                                Long.parseLong(config.getProperty("retry.sleep.time", "1000")));
 
-                try (PreparedStatement updatePstmt = conn.prepareStatement(updateSQL)) {
-                    updatePstmt.setBigDecimal(1, balance);
-                    updatePstmt.setString(2, address);
-                    updatePstmt.executeUpdate();
-                }
-            } else {
-                try (PreparedStatement insertPstmt = conn.prepareStatement(insertSQL)) {
+                        BigInteger balanceInWei = ethGetBalance.getBalance();
+                        BigDecimal balanceInEth = Convert.fromWei(balanceInWei.toString(), Convert.Unit.ETHER);
+
+                        if (balanceInEth.compareTo(BigDecimal.ZERO) > 0) {
+                            updateBalanceInDatabase(address, balanceInEth);
+                        }
+                    } catch (Exception e) {
+                        log.error("Error checking balance for address " + address, e);
+                    }
+                }, customThreadPool))
+                .collect(Collectors.toList());
+
+        futures.forEach(CompletableFuture::join);
+    }
+
+    private void updateBalanceInDatabase(String address, BigDecimal balance) {
+        String updateSQL = "UPDATE " + BALANCES_TABLE + " SET balance = ? WHERE address = ?";
+        String insertSQL = "INSERT INTO " + BALANCES_TABLE + " (address, balance) VALUES (?, ?)";
+
+        try (Connection conn = database.getConnection()) {
+            conn.setAutoCommit(false);
+
+            try (PreparedStatement updatePstmt = conn.prepareStatement(updateSQL);
+                 PreparedStatement insertPstmt = conn.prepareStatement(insertSQL)) {
+
+                // 先尝试更新
+                updatePstmt.setBigDecimal(1, balance);
+                updatePstmt.setString(2, address);
+                int rowsAffected = updatePstmt.executeUpdate();
+
+                // 如果没有更新到，插入新记录
+                if (rowsAffected == 0) {
                     insertPstmt.setString(1, address);
                     insertPstmt.setBigDecimal(2, balance);
                     insertPstmt.executeUpdate();
                 }
-            }
 
+                conn.commit();
+            } catch (SQLException e) {
+                conn.rollback();
+                log.error("Failed to update/insert balance for address " + address, e);
+            }
         } catch (SQLException e) {
-            log.error("Failed to update balance for address: " + address, e);
+            log.error("Failed to manage database connection", e);
         }
     }
 }
